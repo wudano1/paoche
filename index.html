@@ -100,6 +100,7 @@ details.areas[open] summary::before{content:"－ "}
 .bar{height:8px;border-radius:999px;background:var(--surface-2);overflow:hidden}
 .bar > i{display:block;height:100%;background:var(--accent);border-radius:999px}
 .bar.warn > i{background:var(--bad)}
+.bar.ok > i{background:var(--good)}
 .ledger{display:flex;flex-direction:column;gap:6px;font-size:15px}
 .ledger .line{display:flex;justify-content:space-between;gap:10px}
 .ledger .line.total{border-top:1px solid var(--line);padding-top:8px;margin-top:2px;font-weight:800}
@@ -182,7 +183,8 @@ const AREAS = [
 ];
 const DROP_ONLY = new Set(["松山機場","桃園機場"]);
 const OUT_ZONE = "營業區外";
-const COURSE = { takeRate:0.75, fuelPerHour:21, benchLow:410, benchHigh:530, safe:350 };
+const COURSE = { takeRate:0.75, fuelPerHour:21, benchLow:410, benchHigh:530, safe:350, dailyTarget:3500 };
+const FUEL = { kmPerL:20, price:32.7 };
 const CNY = [new Date(2027,1,6).getTime(), new Date(2028,0,26).getTime()];
 const COST_KINDS = ["加油","停車","罰單","洗車","保養","其他"];
 const DOW = ["一","二","三","四","五","六","日"];
@@ -203,25 +205,28 @@ function fmtDur(ms){ const m = Math.round(ms/MIN), h = Math.floor(m/60); if (h >
 function hm(t){ const d = new Date(t); return pad(d.getHours())+":"+pad(d.getMinutes()); }
 function md(t){ const d = new Date(t); return (d.getMonth()+1)+"/"+d.getDate()+"（"+DOW[dowOf(t)]+"）"; }
 function startOfDay(t){ const d = new Date(t); d.setHours(0,0,0,0); return d.getTime(); }
+// 跟 Uber 一樣用凌晨 4 點切一天、週一凌晨 4 點切一週
+function workDayStart(t){ return startOfDay(t - 4*3600000) + 4*3600000; }
+function weekStart(t){ const ds = workDayStart(t); return ds - ((new Date(ds).getDay() + 6) % 7) * 86400000; }
 
 /* ===== 狀態 ===== */
 const defaultCurrent = () => ({ status:"offline", shiftId:null, shiftDay:null, waitStart:null, waitArea:null, pending:null, breakStart:null, rainDate:null, holidayDate:null, recent:[] });
-const defaultSettings = () => ({ takeRate:COURSE.takeRate, fuelPerHour:COURSE.fuelPerHour, autoLoc:true, fixed:{ kaohang:0, insurance:0, loan:0, phone:0, other:0 } });
-const defaultMeta = () => ({ lastBackup:null, installDismissed:false, backupSnooze:null });
+const defaultSettings = () => ({ takeRate:COURSE.takeRate, fuelPerHour:COURSE.fuelPerHour, dailyTarget:COURSE.dailyTarget, kmPerL:FUEL.kmPerL, fuelPrice:FUEL.price, autoLoc:true, fixed:{ kaohang:0, insurance:0, loan:0, phone:0, other:0 } });
+const defaultMeta = () => ({ lastBackup:null, installDismissed:false, backupSnooze:null, targetAck:null });
 const S = {
   mode:"starting",          // local | memory
   ready:false,
   days:{}, current:defaultCurrent(), settings:defaultSettings(),
   tab:"drive", period:"week", demo:null, sheet:null,
   notice:null, migrate:null, armed:null, staleDismissed:false,
-  costKind:"加油", costDraft:"", costDateDraft:"", meta:defaultMeta(), persisted:null, importText:""
+  costKind:"加油", costDraft:"", costDateDraft:"", meta:defaultMeta(), persisted:null, importText:"", recon:{}
 };
 let DB = null;
 
 /* ===== 儲存：全部存在這支手機（localStorage），可以下載備份檔 ===== */
 const LS_KEY = "paoche-v1";
 function readLocal(){ try { const raw = localStorage.getItem(LS_KEY); return raw ? JSON.parse(raw) : null; } catch(e){ return null; } }
-function writeLocal(){ try { localStorage.setItem(LS_KEY, JSON.stringify({ days:S.days, current:S.current, settings:S.settings, meta:S.meta })); return true; } catch(e){ return false; } }
+function writeLocal(){ try { localStorage.setItem(LS_KEY, JSON.stringify({ days:S.days, current:S.current, settings:S.settings, meta:S.meta, recon:S.recon })); return true; } catch(e){ return false; } }
 function persist(){
   if (writeLocal()){ if (S.mode !== "local"){ S.mode = "local"; renderSync(); } return; }
   if (S.mode !== "memory"){
@@ -247,6 +252,7 @@ function initStore(){
     S.settings = Object.assign(defaultSettings(), saved.settings || {});
     S.settings.fixed = Object.assign(defaultSettings().fixed, (saved.settings || {}).fixed || {});
     S.meta = Object.assign(defaultMeta(), saved.meta || {});
+    S.recon = saved.recon && typeof saved.recon === "object" ? saved.recon : {};
   }
   persist();
   S.ready = true;
@@ -262,7 +268,7 @@ function downloadFile(name, text, type){
 }
 function backupNow(){
   const now = Date.now();
-  downloadFile("跑車紀錄備份-"+dayKey(now)+".json", JSON.stringify({ app:"paoche", version:1, exported:now, days:S.days, settings:S.settings }), "application/json");
+  downloadFile("跑車紀錄備份-"+dayKey(now)+".json", JSON.stringify({ app:"paoche", version:2, exported:now, days:S.days, settings:S.settings, recon:S.recon }), "application/json");
   S.meta.lastBackup = now; persist();
   S.notice = { kind:"info", text:"備份檔已下載。iPhone 會放在「檔案」App 的「下載項目」，建議再上傳一份到 Google 雲端硬碟。" };
   render();
@@ -279,6 +285,7 @@ function mergeImport(obj){
       (Array.isArray(from[f]) ? from[f] : []).forEach(x => { if (x && typeof x === "object" && !ids.has(key(x))){ to[f].push(x); ids.add(key(x)); added++; } });
     });
   });
+  if (obj.recon && typeof obj.recon === "object") Object.keys(obj.recon).forEach(k => { if (S.recon[k] == null && Number(obj.recon[k]) >= 0) S.recon[k] = Number(obj.recon[k]); });
   if (obj.settings && typeof obj.settings === "object"){
     const fx = Object.assign({}, S.settings.fixed, obj.settings.fixed || {});
     S.settings = Object.assign(defaultSettings(), S.settings, obj.settings); S.settings.fixed = fx;
@@ -393,7 +400,7 @@ function intervals(now){
     const brs = (sh.breaks||[]).map(b => [b.start, b.end || now]);
     if (cur.shiftId === sh.id && cur.status === "break" && cur.breakStart) brs.push([cur.breakStart, now]);
     brs.forEach(([bs,be]) => { const n = []; segs.forEach(([s,e]) => { if (be <= s || bs >= e) n.push([s,e]); else { if (bs > s) n.push([s,bs]); if (be < e) n.push([be,e]); } }); segs = n; });
-    segs.forEach(([s,e]) => { if (e > s) out.push({ s, e }); });
+    segs.forEach(([s,e]) => { if (e > s) out.push({ s, e, sid:sh.id }); });
   }));
   return out.sort((a,b) => a.s - b.s);
 }
@@ -401,38 +408,64 @@ function trips(){ const out = []; Object.values(allDays()).forEach(d => (d.trips
 function idles(){ const out = []; Object.values(allDays()).forEach(d => (d.idle||[]).forEach(t => out.push(t))); return out; }
 function expenses(){ const out = []; Object.values(allDays()).forEach(d => (d.expenses||[]).forEach(t => out.push(t))); return out.sort((a,b) => b.ts - a.ts); }
 const tripTotal = t => (Number(t.fare)||0) + (Number(t.tip)||0);
+const realTrips = () => trips().filter(t => !t.adj);
+function allShifts(){ const out = []; Object.values(allDays()).forEach(d => (d.shifts||[]).forEach(x => out.push(x))); return out.sort((a,b) => a.start - b.start); }
+function shiftKm(sh){ const a = Number(sh.odoStart), b = Number(sh.odoEnd); return (a > 0 && b > a && b - a < 1500) ? b - a : null; }
+function lastOdo(){ let v = null; allShifts().forEach(sh => { if (Number(sh.odoEnd) > 0) v = Number(sh.odoEnd); else if (Number(sh.odoStart) > 0) v = Number(sh.odoStart); }); return v; }
 function periodStart(p, now){
-  if (p === "today") return startOfDay(now);
-  if (p === "week"){ const s = startOfDay(now); return s - dowOf(now)*DAY; }
-  if (p === "month"){ const d = new Date(now); return new Date(d.getFullYear(), d.getMonth(), 1).getTime(); }
+  if (p === "today") return workDayStart(now);
+  if (p === "week") return weekStart(now);
+  if (p === "month"){ const d = new Date(now - 4*HOUR); return new Date(d.getFullYear(), d.getMonth(), 1, 4).getTime(); }
   let first = now;
   intervals(now).forEach(i => { if (i.s < first) first = i.s; });
   expenses().forEach(e => { if (e.ts < first) first = e.ts; });
   return startOfDay(first);
 }
 function summary(p, now){
-  const from = periodStart(p, now);
-  let online = 0; intervals(now).forEach(i => { const s = Math.max(i.s, from), e = Math.min(i.e, now); if (e > s) online += e - s; });
-  const ts = trips().filter(t => t.accepted >= from && t.accepted <= now);
-  const fare = ts.reduce((a,t) => a + tripTotal(t), 0);
+  const from = periodStart(p, now), st = S.settings;
+  let online = 0; const perShift = {};
+  intervals(now).forEach(i => { const a = Math.max(i.s, from), e = Math.min(i.e, now); if (e > a){ online += e - a; perShift[i.sid] = (perShift[i.sid] || 0) + (e - a); } });
+  const all = trips().filter(t => t.accepted >= from && t.accepted <= now), ts = all.filter(t => !t.adj);
+  const fare = all.reduce((a,t) => a + tripTotal(t), 0), adj = all.filter(t => t.adj).reduce((a,t) => a + tripTotal(t), 0);
   const ex = expenses().filter(e => e.ts >= from && e.ts <= now);
   const fuelActual = ex.filter(e => e.kind === "加油").reduce((a,e) => a + (Number(e.amount)||0), 0);
   const other = ex.filter(e => e.kind !== "加油").reduce((a,e) => a + (Number(e.amount)||0), 0);
-  const fuelEst = online/HOUR * (Number(S.settings.fuelPerHour)||0);
+  // 油錢估算：有記里程的那次上線照公里算，沒記的照上線小時算
+  const kmPerL = Number(st.kmPerL) || FUEL.kmPerL, price = Number(st.fuelPrice) || FUEL.price, perHour = Number(st.fuelPerHour) || 0;
+  const byId = {}; allShifts().forEach(sh => byId[sh.id] = sh);
+  let km = 0, fuelEst = 0, kmShifts = 0, hourShifts = 0;
+  Object.keys(perShift).forEach(id => {
+    const sh = byId[id], k = sh && sh.start >= from ? shiftKm(sh) : null;
+    if (k != null){ km += k; fuelEst += k / kmPerL * price; kmShifts++; } else { fuelEst += perShift[id]/HOUR * perHour; hourShifts++; }
+  });
+  const fuelBasis = kmShifts && !hourShifts ? "km" : kmShifts ? "mixed" : "hour";
   const fuel = fuelActual > 0 ? fuelActual : fuelEst;
-  const f = S.settings.fixed || {};
+  const realKmPerL = fuelActual > 0 && fuelBasis === "km" && km >= 800 ? km / (fuelActual / price) : null;
+  const f = st.fixed || {};
   const monthlyFixed = ["kaohang","insurance","loan","phone","other"].reduce((a,k) => a + (Number(f[k])||0), 0);
   const days = Math.max(1, Math.ceil((now - from) / DAY));
   const fixed = monthlyFixed * days / 30;
   const net = fare - fuel - other - fixed;
   const hrs = online / HOUR;
-  return { from, online, hrs, trips:ts.length, fare, fuelActual, fuelEst, fuel, fuelIsActual: fuelActual > 0, other, fixed, monthlyFixed, days, net,
-    grossPerHour: hrs > 0 ? fare/hrs : 0, netPerHour: hrs > 0 ? net/hrs : 0 };
+  // 空車率
+  const occupied = ts.reduce((a,t) => a + Math.max(0, (t.ended||t.accepted) - (t.boarded || t.accepted)), 0);
+  const boardedTrips = ts.filter(t => t.boarded);
+  const pickupAvg = boardedTrips.length ? boardedTrips.reduce((a,t) => a + (t.boarded - t.accepted), 0) / boardedTrips.length : null;
+  let qKm = 0, qTripKm = 0;
+  Object.keys(perShift).forEach(id => {
+    const sh = byId[id], k = sh && sh.start >= from ? shiftKm(sh) : null; if (k == null) return;
+    const st2 = ts.filter(t => t.shiftId === id); if (!st2.length || st2.some(t => !(Number(t.km) > 0))) return;
+    qKm += k; qTripKm += st2.reduce((a,t) => a + Number(t.km), 0);
+  });
+  return { from, online, hrs, trips:ts.length, fare, adj, fuelActual, fuelEst, fuel, fuelIsActual: fuelActual > 0, fuelBasis, km, kmPerL, price, realKmPerL,
+    other, fixed, monthlyFixed, days, net, grossPerHour: hrs > 0 ? fare/hrs : 0, netPerHour: hrs > 0 ? net/hrs : 0,
+    emptyTime: online > 0 ? Math.max(0, 1 - occupied/online) : null, boardedShare: ts.length ? boardedTrips.length / ts.length : 0, pickupAvg,
+    emptyKm: qKm > 0 ? Math.max(0, 1 - qTripKm/qKm) : null };
 }
 function areaStats(from, now){
   const m = {};
   const get = a => m[a] || (m[a] = { area:a, trips:0, wait:0, ride:0, fare:0 });
-  trips().filter(t => t.accepted >= from && t.accepted <= now).forEach(t => {
+  realTrips().filter(t => t.accepted >= from && t.accepted <= now).forEach(t => {
     const a = get(t.area || "未選區域"); a.trips++; a.wait += Math.max(0, t.accepted - t.waitStart); a.ride += Math.max(0, (t.ended||t.accepted) - t.accepted); a.fare += tripTotal(t);
   });
   idles().filter(i => i.start >= from && i.start <= now).forEach(i => { const a = get(i.area || "未選區域"); a.wait += Math.max(0, i.end - i.start); });
@@ -445,7 +478,7 @@ function heat(from, now){
     let t = Math.max(i.s, from); const e = Math.min(i.e, now);
     while (t < e){ const d = new Date(t); const nh = new Date(d.getFullYear(), d.getMonth(), d.getDate(), d.getHours()+1).getTime(); const seg = Math.min(nh, e) - t; on[dowOf(t)][Math.floor(d.getHours()/3)] += seg; t += seg; }
   });
-  trips().filter(t => t.accepted >= from && t.accepted <= now).forEach(t => { fare[dowOf(t.accepted)][Math.floor(new Date(t.accepted).getHours()/3)] += tripTotal(t); });
+  realTrips().filter(t => t.accepted >= from && t.accepted <= now).forEach(t => { fare[dowOf(t.accepted)][Math.floor(new Date(t.accepted).getHours()/3)] += tripTotal(t); });
   return on.map((row,r) => row.map((ms,c) => ms >= 20*MIN ? fare[r][c] / (ms/HOUR) : null));
 }
 function rollingOnline(now){
@@ -465,9 +498,10 @@ function closeIdle(now){
   if (now - c.waitStart >= MIN){ dayDoc(c.shiftDay).idle.push({ area:c.waitArea, start:c.waitStart, end:now }); }
 }
 const act = {
-  start(){
+  start(odo){
     const now = Date.now(), key = dayKey(now), id = uid();
-    dayDoc(key).shifts.push({ id, start:now, end:null, breaks:[] });
+    dayDoc(key).shifts.push({ id, start:now, end:null, breaks:[], odoStart: odo > 0 ? odo : null });
+    S.sheet = null;
     Object.assign(S.current, { status:"waiting", shiftId:id, shiftDay:key, waitStart:now, waitArea:(S.current.recent||[])[0] || null, pending:null, breakStart:null });
     saveDay(key); saveCurrent(); render();
     autoArea();
@@ -487,12 +521,16 @@ const act = {
       render();
     });
   },
+  board(){
+    const p = S.current.pending; if (!p || p.boarded) return;
+    p.boarded = Date.now(); saveCurrent(); render();
+  },
   cancelTrip(){
     const c = S.current; c.status = "waiting"; c.waitStart = c.pending ? c.pending.waitStart : Date.now(); c.pending = null; saveCurrent(); render();
   },
   complete(v){
     const c = S.current, now = Date.now(), p = c.pending || { area:c.waitArea, waitStart:now, accepted:now };
-    dayDoc(c.shiftDay || dayKey(now)).trips.push({ id:uid(), shiftId:c.shiftId, area:p.area, waitStart:p.waitStart, accepted:p.accepted, ended:now, fare:v.fare, tip:v.tip, surge:v.surge, drop:v.drop, pickLoc:p.loc || null, dropLoc:v.dropLoc || null });
+    dayDoc(c.shiftDay || dayKey(now)).trips.push({ id:uid(), shiftId:c.shiftId, area:p.area, waitStart:p.waitStart, accepted:p.accepted, ended:now, fare:v.fare, tip:v.tip, surge:v.surge, drop:v.drop, pickLoc:p.loc || null, dropLoc:v.dropLoc || null, boarded:p.boarded || null, km:v.km > 0 ? v.km : null });
     touchRecent(v.drop);
     Object.assign(c, { status:"waiting", pending:null, waitStart:now, waitArea:v.drop || p.area });
     saveDay(c.shiftDay || dayKey(now)); saveCurrent(); S.sheet = null; render();
@@ -506,8 +544,9 @@ const act = {
     if (sh && c.breakStart){ sh.breaks = sh.breaks || []; sh.breaks.push({ start:c.breakStart, end:now }); saveDay(c.shiftDay); }
     Object.assign(c, { status:"waiting", breakStart:null, waitStart:now }); saveCurrent(); render();
   },
-  end(at){
+  end(at, odo){
     const c = S.current, now = at || Date.now(), sh = findShift(c.shiftId);
+    if (sh && odo > 0) sh.odoEnd = odo;
     if (c.status === "waiting") closeIdle(now);
     if (sh){ if (c.status === "break" && c.breakStart){ sh.breaks = sh.breaks || []; sh.breaks.push({ start:c.breakStart, end:Math.max(c.breakStart, now) }); } sh.end = now; saveDay(c.shiftDay); }
     Object.assign(c, { status:"offline", shiftId:null, shiftDay:null, waitStart:null, pending:null, breakStart:null });
@@ -521,6 +560,14 @@ const act = {
     const [y,mo,d] = date.split("-").map(Number); const ts = new Date(y, mo-1, d, 12).getTime(); const key = dayKey(ts);
     dayDoc(key).expenses.push({ id:uid(), ts, kind, amount });
     saveDay(key); S.notice = { kind:"info", text:"已記下 "+kind+" "+money(amount) }; render();
+  },
+  reconFix(key){
+    const ws = new Date(key+"T04:00:00").getTime(), we = ws + 7*DAY, uber = Number(S.recon[key]);
+    const rec = trips().filter(t => t.accepted >= ws && t.accepted < we).reduce((a,t) => a + tripTotal(t), 0);
+    const diff = Math.round(uber - rec); if (!(diff > 0)) return;
+    const t = Math.min(we - MIN, Date.now()), dk = dayKey(t);
+    dayDoc(dk).trips.push({ id:uid(), adj:true, area:"對帳補記", waitStart:t, accepted:t, ended:t, fare:diff, tip:0, surge:false, drop:"" });
+    saveDay(dk); S.notice = { kind:"info", text:"已補記 "+money(diff)+"，這筆只算進收入，不會算進區域和時段分析。" }; render();
   },
   remove(kind, id){
     for (const k of Object.keys(S.days)){
@@ -573,6 +620,29 @@ function todayStats(now){
     stat(fmtHours(s.online), "上線小時")+stat(s.trips, "趟數")+stat(money(s.fare), "實拿")+stat(s.hrs > 0.2 ? money(s.grossPerHour) : "—", "每小時實拿")+'</div></section>';
   function stat(v,k){ return '<div class="stat"><span class="v">'+v+'</span><span class="k">'+k+'</span></div>'; }
 }
+function targetCard(now){
+  const tgt = Number(S.settings.dailyTarget) || 0; if (!tgt) return "";
+  const s = summary("today", now), done = s.fare >= tgt, pct = Math.min(100, s.fare / tgt * 100);
+  const rate = s.hrs >= 0.5 && s.grossPerHour > 0 ? s.grossPerHour : COURSE.safe;
+  const left = Math.max(0, tgt - s.fare), need = left / rate;
+  return '<section class="card"><div class="spread"><h2 style="margin:0">今日目標</h2><span class="num" style="font-size:22px">'+money(s.fare)+' / '+money(tgt)+'</span></div>'+
+    '<div class="bar'+(done ? " ok" : "")+'" style="margin-top:10px;height:10px"><i style="width:'+pct.toFixed(1)+'%"></i></div>'+
+    '<p class="small '+(done ? "" : "muted")+'" style="margin:8px 0 0'+(done ? ";color:var(--good);font-weight:700" : "")+'">'+
+    (done ? "今天達標了，可以考慮收工；如果現在是黃金時段，也可以再多跑一下。" : "還差 "+money(left)+"，照"+(s.hrs >= 0.5 ? "你今天" : "講義保守的")+"每小時 "+money(rate)+"，大約再跑 "+(need < 1 ? Math.max(5, Math.round(need*60))+" 分鐘" : need.toFixed(1)+" 小時")+"。")+'</p></section>';
+}
+function quitBanner(now){
+  const c = S.current; if (c.status === "offline") return "";
+  const ms = rollingOnline(now);
+  if (ms >= 11*HOUR){
+    const left = Math.max(0, 12*HOUR - ms);
+    return '<div class="banner bad"><span>已累計上線 '+fmtHours(ms)+' 小時。'+(left > 0 ? "再 "+fmtDur(left)+" 就到 12 小時，Uber 會強制下線 6 小時，" : "已經到 12 小時，Uber 會強制下線 6 小時，")+'先找好收工或休息的地方。</span></div>';
+  }
+  const tgt = Number(S.settings.dailyTarget) || 0, k = dayKey(workDayStart(now));
+  if (tgt && S.meta.targetAck !== k && summary("today", now).fare >= tgt){
+    return '<div class="banner info"><span>今天的目標 '+money(tgt)+' 達成了。累了就收工，還有體力可以看看現在是不是黃金時段。</span><div><button class="btn ghost" data-act="ackTarget">知道了</button></div></div>';
+  }
+  return "";
+}
 function capCard(now){
   const ms = rollingOnline(now), pct = Math.min(100, ms / (12*HOUR) * 100), warn = ms >= 10*HOUR;
   return '<section class="card"><div class="spread"><h2 style="margin:0">累計上線</h2><span class="num" style="font-size:22px">'+fmtHours(ms)+' / 12 小時</span></div>'+
@@ -602,11 +672,11 @@ function viewDrive(now){
   if (!S.ready){
     return h + slotCard(now) + '<section class="card"><p class="muted" style="margin:0">'+"準備中…"+'</p></section>';
   }
-  h += installBanner() + backupBanner(now);
+  h += quitBanner(now) + installBanner() + backupBanner(now);
   if (c.status === "offline"){
     h += slotCard(now);
     h += '<button type="button" class="btn primary" data-act="start">開始上線</button>';
-    h += todayStats(now);
+    h += targetCard(now) + todayStats(now);
     h += rulesCard(true);
     return h;
   }
@@ -617,23 +687,26 @@ function viewDrive(now){
     h += '<button type="button" class="btn primary" data-act="accept">接到單了</button>';
     h += '<section class="card"><h2>你在哪一區</h2>'+areaPicker(c.waitArea, "area", { open: !c.waitArea })+'</section>';
     h += '<div class="grid2"><button type="button" class="btn" data-act="pause">休息一下</button><button type="button" class="btn danger" data-act="askEnd">下線</button></div>';
-    h += todayStats(now) + capCard(now) + slotCard(now, true);
+    h += targetCard(now) + todayStats(now) + capCard(now) + slotCard(now, true);
     return h;
   }
   if (c.status === "ontrip"){
     const p = c.pending || {};
-    h += '<section class="card status"><div class="label"><span class="pill max">載客中</span><span>'+esc(p.area || "")+' 上車 · 等了 '+fmtDur((p.accepted||now) - (p.waitStart||now))+'</span></div>'+
-      '<div class="timer" data-tick="trip">'+fmtClock(now - (p.accepted || now))+'</div>'+zoneWarning(p.area)+'</section>';
+    const sub = p.boarded ? "前往接客 "+fmtDur(p.boarded - p.accepted)+" · "+esc(p.area || "")+" 上車" : esc(p.area || "")+" 接單 · 等了 "+fmtDur((p.accepted||now) - (p.waitStart||now));
+    h += '<section class="card status"><div class="label"><span class="pill '+(p.boarded ? "max" : "good")+'">'+(p.boarded ? "載客中" : "前往接客")+'</span><span>'+sub+'</span></div>'+
+      '<div class="timer" data-tick="trip">'+fmtClock(now - (p.boarded || p.accepted || now))+'</div>'+zoneWarning(p.area)+
+      (p.boarded ? "" : '<p class="small muted" style="margin:6px 0 0">乘客上車時按一下「乘客上車了」，就能算出接客要開多久（可以不按）。</p>')+'</section>';
+    if (!p.boarded) h += '<button type="button" class="btn" style="min-height:56px;font-size:18px" data-act="board">乘客上車了</button>';
     h += '<button type="button" class="btn good" data-act="openComplete">完成這趟</button>';
     h += '<button type="button" class="btn" data-act="cancelTrip">乘客取消／沒載到</button>';
-    h += todayStats(now) + capCard(now);
+    h += targetCard(now) + todayStats(now) + capCard(now);
     return h;
   }
   if (c.status === "break"){
     h += '<section class="card status"><div class="label"><span class="pill low">休息中</span><span class="muted">不算進上線時間</span></div><div class="timer" data-tick="break">'+fmtClock(now - (c.breakStart || now))+'</div></section>';
     h += '<button type="button" class="btn primary" data-act="resume">回來接單</button>';
     h += '<button type="button" class="btn danger" data-act="askEnd">下線</button>';
-    h += todayStats(now) + capCard(now) + slotCard(now, true);
+    h += targetCard(now) + todayStats(now) + capCard(now) + slotCard(now, true);
     return h;
   }
   return h;
@@ -668,11 +741,14 @@ function viewReport(now){
     '<p class="small muted" style="margin:8px 0 0">講義截圖的每小時實拿約 '+money(COURSE.benchLow)+'–'+money(COURSE.benchHigh)+'（已扣 Uber 25%、未扣油錢），講師保守說法是時段抓好 '+money(COURSE.safe)+' 以上。你的是 <strong style="color:var(--text)">'+(s.hrs > 0.2 ? money(s.grossPerHour) : "—")+'</strong>（滿格是 $600）。</p></section>';
   h += '<section class="card"><h2>收支明細</h2><div class="ledger">'+
     line("實拿（含小費）", s.fare)+
-    line(s.fuelIsActual ? "油錢（你記的加油）" : "油錢（估：每上線小時 "+money(S.settings.fuelPerHour)+"）", -s.fuel)+
+    line(s.fuelIsActual ? "油錢（你記的加油）" : s.fuelBasis === "km" ? "油錢（照 "+Math.round(s.km)+" 公里估）" : s.fuelBasis === "mixed" ? "油錢（有記里程照公里、沒記照時數估）" : "油錢（估：每上線小時 "+money(S.settings.fuelPerHour)+"）", -s.fuel)+
     line("其他支出（停車、罰單等）", -s.other)+
     line("固定支出分攤（"+s.days+" 天）", -s.fixed)+
     '<div class="line total"><span>淨收入</span><span class="num">'+money(s.net)+'</span></div></div>'+
+    (s.adj ? '<p class="small muted" style="margin:10px 0 0">實拿裡有 '+money(s.adj)+' 是對帳補記的。</p>' : '')+
     (s.monthlyFixed ? "" : '<p class="small muted" style="margin:10px 0 0">還沒填靠行費、保險等固定支出，淨收入會偏高。到「設定」填。</p>')+'</section>';
+  h += emptyCard(s);
+  if (!useDemo()) h += reconCard(now);
   const as = areaStats(s.from, now);
   if (as.length){
     const max = Math.max.apply(null, as.map(a => a.perHour).concat([1]));
@@ -685,11 +761,52 @@ function viewReport(now){
     hm8.map((row,r) => '<div class="d">'+DOW[r]+'</div>'+row.map(v => v == null ? '<div class="c">·</div>' : '<div class="c" style="background:rgba(242,179,61,'+(0.15 + 0.75*v/hmax).toFixed(2)+');color:'+(v/hmax > .55 ? "#1d1405" : "var(--text)")+'">'+Math.round(v)+'</div>').join("")).join("")+
     '</div><p class="small muted" style="margin:8px 0 0">橫軸是幾點開始的 3 小時，有上線滿 20 分鐘的格子才會算。</p></section>';
   const recent = trips().filter(t => t.accepted >= s.from).slice(-15).reverse();
+  const tripMeta = t => t.adj ? md(t.accepted)+" · 只算收入" : md(t.accepted)+' '+hm(t.accepted)+' · 等 '+Math.round((t.accepted-t.waitStart)/MIN)+' 分'+(t.boarded ? ' · 接客 '+Math.round((t.boarded-t.accepted)/MIN)+' 分' : '')+' · 載 '+Math.round(((t.ended||t.accepted)-(t.boarded||t.accepted))/MIN)+' 分'+(Number(t.km) > 0 ? ' · '+t.km+' 公里' : '');
   if (recent.length){
-    h += '<section class="card"><h2>最近幾趟</h2><div class="list">'+recent.map(t => '<div class="item"><div><div>'+esc(t.area||"未選區域")+(t.drop && t.drop !== t.area ? ' → '+esc(t.drop) : '')+(t.surge ? ' <span class="pill gold" style="font-size:11px;padding:1px 6px">加成</span>' : '')+'</div><div class="meta">'+md(t.accepted)+' '+hm(t.accepted)+' · 等 '+Math.round((t.accepted-t.waitStart)/MIN)+' 分 · 載 '+Math.round(((t.ended||t.accepted)-t.accepted)/MIN)+' 分</div></div><div class="row" style="flex-wrap:nowrap"><span class="num" style="font-size:20px">'+money(tripTotal(t))+'</span>'+(useDemo() ? "" : delBtn("trips", t.id))+'</div></div>').join("")+'</div></section>';
+    h += '<section class="card"><h2>最近幾趟</h2><div class="list">'+recent.map(t => '<div class="item"><div><div>'+esc(t.area||"未選區域")+(t.drop && t.drop !== t.area ? ' → '+esc(t.drop) : '')+(t.surge ? ' <span class="pill gold" style="font-size:11px;padding:1px 6px">加成</span>' : '')+'</div><div class="meta">'+tripMeta(t)+'</div></div><div class="row" style="flex-wrap:nowrap"><span class="num" style="font-size:20px">'+money(tripTotal(t))+'</span>'+(useDemo() ? "" : delBtn("trips", t.id))+'</div></div>').join("")+'</div></section>';
   }
   return h;
   function line(k, v){ return '<div class="line"><span class="muted">'+k+'</span><span class="num">'+(v < 0 ? "−" : "")+money(Math.abs(v))+'</span></div>'; }
+}
+function emptyCard(s){
+  if (s.emptyTime == null) return "";
+  const pct = v => Math.round(v*100)+"%";
+  let h = '<section class="card"><h2>空車率與里程</h2><div class="stats" style="grid-template-columns:repeat(3,1fr)">'+
+    st(pct(s.emptyTime), "時間空車率")+st(s.emptyKm != null ? pct(s.emptyKm) : "—", "距離空車率")+st(s.pickupAvg != null ? Math.round(s.pickupAvg/MIN)+" 分" : "—", "平均接客時間")+'</div>';
+  const notes = [];
+  notes.push("時間空車率 = 上線時間裡沒有載客的比例"+(s.boardedShare < 1 ? "。沒按「乘客上車了」的趟，接客那段會算成載客，所以實際會再高一點。" : "。"));
+  notes.push(s.emptyKm != null ? "距離空車率 = 開的公里數裡沒有載客的比例（只算有記上下線里程、而且每趟都填了載客公里的那幾次上線）。" : "要算距離空車率：上線、下線時輸入里程表，每趟完成時填載客公里。");
+  if (s.km > 0) notes.push("這段期間記到 "+Math.round(s.km)+" 公里"+(s.realKmPerL ? "，照你記的加油算，實際油耗約每公升 "+s.realKmPerL.toFixed(1)+" 公里（加油時間不一定剛好對齊，看整個月會比較準）" : "")+"。");
+  h += '<ul class="rules small muted" style="margin-top:10px">'+notes.map(n => '<li>'+n+'</li>').join("")+'</ul></section>';
+  return h;
+  function st(v,k){ return '<div class="stat"><span class="v">'+v+'</span><span class="k">'+k+'</span></div>'; }
+}
+function reconCard(now){
+  const rows = []; let ws = weekStart(now);
+  for (let i = 0; i < 8; i++){
+    const we = ws + 7*DAY, key = dayKey(ws);
+    const all = trips().filter(t => t.accepted >= ws && t.accepted < we);
+    const rec = all.reduce((a,t) => a + tripTotal(t), 0), n = all.filter(t => !t.adj).length, uber = S.recon[key];
+    if (i === 0 || n || uber != null) rows.push({ ws, we, key, rec, n, uber, current: i === 0 });
+    ws -= 7*DAY;
+  }
+  let h = '<section class="card"><h2>每週跟 Uber 對帳</h2><div class="list">';
+  rows.forEach(r => {
+    const label = md(r.ws)+" – "+md(r.we - 5*HOUR);
+    let status = "";
+    if (r.uber == null) status = '<span class="small muted">'+(r.current ? "本週還沒結束，下週一出對帳單再填" : "填 Uber 的週總額來對帳")+'</span>';
+    else {
+      const diff = Math.round(r.uber - r.rec), tol = Math.max(30, r.uber * 0.005);
+      if (Math.abs(diff) <= tol) status = '<span class="pill max">對上了</span>';
+      else if (diff > 0){
+        const avg = r.n ? r.rec / r.n : 0;
+        status = '<span class="warnline">少記 '+money(diff)+(avg > 0 ? "（約 "+Math.max(1, Math.round(diff/avg))+" 趟）" : "")+'</span> <button type="button" class="chip" data-act="reconFix" data-key="'+r.key+'">補記差額</button>';
+      } else status = '<span class="warnline">多記 '+money(-diff)+'，檢查有沒有重複記或金額填錯</span>';
+    }
+    h += '<div class="item" style="flex-direction:column;align-items:stretch;gap:8px"><div class="spread"><strong>'+label+'</strong><span class="small muted">你記的 '+money(r.rec)+'（'+r.n+' 趟）</span></div>'+
+      '<div class="grid2" style="align-items:center"><input type="number" inputmode="numeric" min="0" placeholder="Uber 週總額" aria-label="'+label+' Uber 週總額" id="recon-'+r.key+'" data-recon="'+r.key+'" value="'+(r.uber != null ? esc(r.uber) : "")+'" style="font-size:18px;min-height:46px;padding:8px 12px"><div>'+status+'</div></div></div>';
+  });
+  return h + '</div><p class="small muted" style="margin:8px 0 0">填 Uber App「收入」裡的週總額（行程費用，含小費）。Uber 每週一出上週的對帳單，一週從週一凌晨 4 點算到下週一凌晨 4 點，這裡也用一樣的切法。</p></section>';
 }
 function delBtn(kind, id){ const armed = S.armed === kind+":"+id; return '<button type="button" class="x'+(armed ? " armed" : "")+'" data-act="del" data-kind="'+kind+'" data-id="'+esc(id)+'" aria-label="刪除">'+(armed ? "確定刪" : "刪除")+'</button>'; }
 function viewCost(now){
@@ -710,9 +827,14 @@ function viewSettings(){
   let h = noticeHTML();
   h += '<section class="card"><h2>講義的預設值</h2><div class="grid2">'+
     '<label class="field" for="takeRate">實拿比例（%）<input id="takeRate" type="number" inputmode="decimal" step="1" min="1" max="100" value="'+Math.round((st.takeRate||0.75)*100)+'" data-set="takeRate"></label>'+
-    '<label class="field" for="fuelPerHour">油錢（每上線小時）<input id="fuelPerHour" type="number" inputmode="numeric" min="0" value="'+esc(st.fuelPerHour)+'" data-set="fuelPerHour"></label></div>'+
+    '<label class="field" for="fuelPerHour">油錢（沒記里程時，每上線小時）<input id="fuelPerHour" type="number" inputmode="numeric" min="0" value="'+esc(st.fuelPerHour)+'" data-set="fuelPerHour"></label></div>'+
     '<p class="small muted" style="margin:10px 0 0">講義：Uber App 顯示的金額已經是司機實拿的 75%，每週四入帳。油錢 21 元是用講師每月加油約 7,300 元，除以每月約 355 個上線小時算的。換你自己的車跑一個月後，改成你的數字更準。</p>'+
     '<p class="small muted" style="margin:6px 0 0">照 75% 回推，乘客付的大約是實拿 ÷ '+(st.takeRate||0.75)+'。</p></section>';
+  h += '<section class="card"><h2>每日目標與油耗</h2><div class="grid2">'+
+    '<label class="field" for="dailyTarget">每日實拿目標<input id="dailyTarget" type="number" inputmode="numeric" min="0" value="'+esc(st.dailyTarget)+'" data-set="dailyTarget"></label>'+
+    '<label class="field" for="kmPerL">油耗（公里／公升）<input id="kmPerL" type="number" inputmode="decimal" step="0.1" min="1" value="'+esc(st.kmPerL)+'" data-set="kmPerL"></label>'+
+    '<label class="field" for="fuelPrice">油價（每公升）<input id="fuelPrice" type="number" inputmode="decimal" step="0.1" min="1" value="'+esc(st.fuelPrice)+'" data-set="fuelPrice"></label></div>'+
+    '<p class="small muted" style="margin:10px 0 0">目標預設 3,500 元：講義保守時薪 350 元 × 10 小時，填 0 就不顯示。油耗先抓 20：Corolla Cross Hybrid 官方數字約 23 公里，市區載客開冷氣通常會比較低。油價預設是 11 月中油 95 無鉛 32.7 元，每週會變，偶爾跟著改。有記上下線里程時，油錢就照公里算。</p></section>';
   h += '<section class="card"><h2>每月固定支出</h2><div class="grid2">'+
     fixedField("kaohang","靠行費")+fixedField("insurance","保險（月平均）")+fixedField("loan","車貸")+fixedField("phone","手機網路")+fixedField("other","其他")+
     '</div><p class="small muted" style="margin:10px 0 0">照你跟車行、保險公司談好的填，報表會照天數分攤。</p></section>';
@@ -737,15 +859,27 @@ function completeSheet(){
     '<p class="hint" style="margin:-6px 0 0">填 Uber App 這趟顯示的金額（已經扣掉 25%）。</p>'+
     '<div class="grid2"><label class="field" for="tip">小費（有的話）<input id="tip" type="number" inputmode="numeric" min="0" placeholder="0" value="'+esc(S.sheet.tip||"")+'"></label>'+
     '<div class="field"><span>這趟有加成嗎</span><button type="button" class="chip" style="min-height:52px;width:100%" data-act="surge" aria-pressed="'+(!!S.sheet.surge)+'">'+(S.sheet.surge ? "有加成" : "沒有")+'</button></div></div>'+
+    '<label class="field" for="tripKm">載客公里（Uber 明細有，可以不填）<input id="tripKm" type="number" inputmode="decimal" step="0.1" min="0" placeholder="例如 6.4" value="'+esc(S.sheet.tripKm||"")+'"></label>'+
     '<div><div class="field"><span>在哪一區下車'+(S.sheet.dropPicked ? "" : GEO.status === "locating" ? "（定位中…）" : S.sheet.dropAuto ? "（自動定位）" : "")+'</span></div>'+areaPicker(drop, "drop")+zoneWarning(drop)+'</div>'+
     '<p id="sheetErr" class="warnline" style="margin:0"></p>'+
     '<button type="button" class="btn good" data-act="saveTrip">存檔，繼續等單</button>'+
     '<button type="button" class="btn ghost" data-act="closeSheet">先不要</button></div></div>';
 }
 function endSheet(){
+  const sh = findShift(S.current.shiftId), start = sh && Number(sh.odoStart) > 0 ? Number(sh.odoStart) : null;
   return '<div class="sheet-wrap" data-act="closeSheet"><div class="sheet" role="dialog" aria-modal="true" aria-labelledby="endTitle">'+
     '<h3 id="endTitle">要下線了嗎？</h3><p class="muted" style="margin:0">下線後這次上線的時間就停止計算。</p>'+
+    '<label class="field" for="odoEnd">現在的里程表（公里，可以不填）<input id="odoEnd" class="big" type="number" inputmode="numeric" min="0" placeholder="'+(start ? "上線時是 "+start : "例如 12345")+'" value="'+esc(S.sheet.odo||"")+'"></label>'+
+    (start ? "" : '<p class="hint" style="margin:-6px 0 0">這次上線沒記出發里程，填了也算不出公里數，下次上線時記得填。</p>')+
+    '<p id="endErr" class="warnline" style="margin:0"></p>'+
     '<button type="button" class="btn primary" data-act="end">下線</button><button type="button" class="btn ghost" data-act="closeSheet">繼續跑</button></div></div>';
+}
+function startSheet(){
+  return '<div class="sheet-wrap" data-act="closeSheet"><div class="sheet" role="dialog" aria-modal="true" aria-labelledby="startTitle">'+
+    '<h3 id="startTitle">開始上線</h3>'+
+    '<label class="field" for="odoStart">現在的里程表（公里，可以不填）<input id="odoStart" class="big" type="number" inputmode="numeric" min="0" placeholder="例如 12345" value="'+esc(S.sheet.odo||"")+'"></label>'+
+    '<p class="hint" style="margin:-6px 0 0">'+(lastOdo() ? "已經幫你填上次下線的里程，數字一樣就直接按開始。" : "上線和下線都記里程，就能算出開了幾公里、空車率和比較準的油錢。")+'</p>'+
+    '<button type="button" class="btn primary" data-act="startGo">開始上線</button><button type="button" class="btn ghost" data-act="closeSheet">先不要</button></div></div>';
 }
 function render(){
   const now = Date.now();
@@ -759,7 +893,8 @@ function render(){
   if (S.sheet && S.sheet.kind === "complete" && S.current.status === "ontrip"){
     sh.innerHTML = completeSheet();
     if (S.sheet.focus !== false){ S.sheet.focus = false; const f = $("#fare", sh); if (f) f.focus(); }
-  } else if (S.sheet && S.sheet.kind === "end"){ sh.innerHTML = endSheet(); }
+  } else if (S.sheet && S.sheet.kind === "end" && S.current.status !== "offline"){ sh.innerHTML = endSheet(); }
+  else if (S.sheet && S.sheet.kind === "start" && S.current.status === "offline"){ sh.innerHTML = startSheet(); }
   else { sh.innerHTML = ""; if (S.sheet && S.sheet.kind === "complete") S.sheet = null; }
   if (focusId){ const el = document.getElementById(focusId); if (el){ if (el.value !== focusVal && el.type !== "date") el.value = focusVal; try { el.focus({ preventScroll:true }); } catch(e){ el.focus(); } } }
 }
@@ -767,7 +902,7 @@ function tick(){
   const now = Date.now(), c = S.current;
   document.querySelectorAll("[data-tick]").forEach(el => {
     const k = el.dataset.tick;
-    const base = k === "wait" ? c.waitStart : k === "trip" ? (c.pending && c.pending.accepted) : c.breakStart;
+    const base = k === "wait" ? c.waitStart : k === "trip" ? (c.pending && (c.pending.boarded || c.pending.accepted)) : c.breakStart;
     el.textContent = fmtClock(now - (base || now));
   });
 }
@@ -782,7 +917,8 @@ function makeDemo(){
     const base = today - i*DAY, dw = dowOf(base), key = dayKey(base);
     const startH = dw >= 5 ? 11 : (dw === 2 || dw === 4 ? 15 : 14), len = (10.5 + rnd()*2) * HOUR;
     const start = base + startH*HOUR, end = start + len, sid = "d"+i;
-    const d = days[key] = { date:key, shifts:[{ id:sid, start, end, breaks:[{ start:start+4*HOUR, end:start+4.5*HOUR }] }], trips:[], idle:[], expenses:[] };
+    const odo0 = 20000 + (7-i)*260;
+    const d = days[key] = { date:key, shifts:[{ id:sid, start, end, breaks:[{ start:start+4*HOUR, end:start+4.5*HOUR }], odoStart:odo0, odoEnd:odo0 + Math.round(len/HOUR*21) }], trips:[], idle:[], expenses:[] };
     let t = start, area = names[Math.floor(rnd()*names.length)];
     while (t < end - 15*MIN){
       if (t >= start+4*HOUR && t < start+4.5*HOUR){ t = start+4.5*HOUR; continue; }
@@ -793,10 +929,11 @@ function makeDemo(){
       const surge = rnd() < 0.1;
       let fare = (55 + dur/MIN*6.4 + rnd()*40) * f * boost * (surge ? 1.3 : 1);
       const drop = rnd() < 0.6 ? area : names[Math.floor(rnd()*names.length)];
-      d.trips.push({ id:"t"+i+"-"+d.trips.length, shiftId:sid, area, waitStart:t, accepted:acc, ended:acc+dur, fare:Math.round(fare), tip:rnd() < 0.05 ? 50 : 0, surge, drop });
+      const pick = (3 + rnd()*6) * MIN;
+      d.trips.push({ id:"t"+i+"-"+d.trips.length, shiftId:sid, area, waitStart:t, accepted:acc, boarded:acc+pick, ended:acc+dur, km:Math.round((dur-pick)/MIN*0.45*10)/10, fare:Math.round(fare), tip:rnd() < 0.05 ? 50 : 0, surge, drop });
       t = acc + dur; area = drop;
     }
-    if (i % 3 === 0) d.expenses.push({ id:"e"+i, ts:base+12*HOUR, kind:"加油", amount:800 + Math.round(rnd()*80) });
+    if (i % 2 === 0) d.expenses.push({ id:"e"+i, ts:base+12*HOUR, kind:"加油", amount:930 + Math.round(rnd()*60) });
   }
   return { days };
 }
@@ -817,7 +954,11 @@ document.addEventListener("click", e => {
     case "importPaste": { const t = ($("#importBox")||{}).value || ""; if (t.trim()) importText(t.trim()); break; }
     case "relocate": autoArea(); break;
     case "autoLoc": S.settings.autoLoc = !S.settings.autoLoc; GEO.status = "idle"; saveSettings(); render(); break;
-    case "start": if (S.ready) act.start(); break;
+    case "start": if (S.ready){ const o = lastOdo(); S.sheet = { kind:"start", odo: o ? String(o) : "" }; render(); } break;
+    case "startGo": { const v = Number(($("#odoStart")||{}).value); act.start(v > 0 ? Math.round(v) : null); break; }
+    case "board": act.board(); break;
+    case "ackTarget": S.meta.targetAck = dayKey(workDayStart(Date.now())); persist(); render(); break;
+    case "reconFix": act.reconFix(el.dataset.key); break;
     case "area": act.area(el.dataset.area); break;
     case "accept": act.accept(); break;
     case "cancelTrip": act.cancelTrip(); break;
@@ -832,12 +973,17 @@ document.addEventListener("click", e => {
       readSheet(); const fare = Number(S.sheet.fare), tip = Number(S.sheet.tip) || 0;
       if (!(fare > 0)){ const er = $("#sheetErr"); if (er) er.textContent = "請填這趟的實拿金額。"; $("#fare") && $("#fare").focus(); break; }
       const p = S.current.pending || {};
-      act.complete({ fare:Math.round(fare), tip:Math.round(tip), surge:!!S.sheet.surge, drop:S.sheet.drop !== undefined ? S.sheet.drop : (p.area || S.current.waitArea), dropLoc:S.sheet.dropLoc || null });
+      const km = Number(S.sheet.tripKm);
+      act.complete({ km: km > 0 && km < 500 ? Math.round(km*10)/10 : null, fare:Math.round(fare), tip:Math.round(tip), surge:!!S.sheet.surge, drop:S.sheet.drop !== undefined ? S.sheet.drop : (p.area || S.current.waitArea), dropLoc:S.sheet.dropLoc || null });
       break; }
     case "pause": act.pause(); break;
     case "resume": act.resume(); break;
-    case "askEnd": S.sheet = { kind:"end" }; render(); break;
-    case "end": act.end(); break;
+    case "askEnd": S.sheet = { kind:"end", odo:"" }; render(); break;
+    case "end": {
+      const v = Number(($("#odoEnd")||{}).value), sh = findShift(S.current.shiftId), st0 = sh && Number(sh.odoStart);
+      if (v > 0 && st0 > 0 && v < st0){ const er = $("#endErr"); if (er) er.textContent = "下線里程比上線時（"+st0+"）還小，請再確認。"; break; }
+      if (v > 0 && st0 > 0 && v - st0 >= 1500){ const er = $("#endErr"); if (er) er.textContent = "這次開了超過 1,500 公里，數字可能打錯了，請再確認。"; break; }
+      act.end(null, v > 0 ? Math.round(v) : null); break; }
     case "endAt": act.end(Number(el.dataset.at)); break;
     case "staleOk": S.staleDismissed = true; render(); break;
     case "closeSheet": S.sheet = null; render(); break;
@@ -861,10 +1007,11 @@ document.addEventListener("input", e => {
   const el = e.target;
   if (el.id === "costAmt") S.costDraft = el.value;
   else if (el.id === "costDate") S.costDateDraft = el.value;
-  else if (S.sheet && (el.id === "fare" || el.id === "tip")) S.sheet[el.id] = el.value;
+  else if (S.sheet && (el.id === "fare" || el.id === "tip" || el.id === "tripKm")) S.sheet[el.id] = el.value;
+  else if (S.sheet && (el.id === "odoStart" || el.id === "odoEnd")) S.sheet.odo = el.value;
   else if (el.id === "importBox") S.importText = el.value;
 });
-function readSheet(){ if (!S.sheet) return; const f = $("#fare"), t = $("#tip"); if (f) S.sheet.fare = f.value; if (t) S.sheet.tip = t.value; }
+function readSheet(){ if (!S.sheet) return; const f = $("#fare"), t = $("#tip"), k = $("#tripKm"); if (f) S.sheet.fare = f.value; if (t) S.sheet.tip = t.value; if (k) S.sheet.tripKm = k.value; }
 document.addEventListener("change", e => {
   const el = e.target;
   if (el.id === "restoreFile" && el.files && el.files[0]){
@@ -872,6 +1019,11 @@ document.addEventListener("change", e => {
     fr.onload = () => importText(String(fr.result || ""));
     fr.onerror = () => { S.notice = { kind:"bad", text:"讀不到這個檔案，請再選一次。" }; render(); };
     fr.readAsText(el.files[0]); el.value = ""; return;
+  }
+  if (el.dataset.recon){
+    const k = el.dataset.recon, raw = String(el.value).trim(), v = Number(raw);
+    if (raw === "") delete S.recon[k]; else if (v >= 0) S.recon[k] = Math.round(v);
+    persist(); render(); return;
   }
   if (el.dataset.set){
     const v = Number(el.value);
@@ -883,8 +1035,8 @@ document.addEventListener("change", e => {
   }
 });
 function toCsv(){
-  const rows = [["日期","星期","接單時間","區域","下車區域","等單分鐘","載客分鐘","實拿","小費","加成","上車緯度","上車經度","下車緯度","下車經度"]];
-  trips().forEach(t => rows.push([dayKey(t.accepted), DOW[dowOf(t.accepted)], hm(t.accepted), t.area||"", t.drop||"", Math.round((t.accepted-t.waitStart)/MIN), Math.round(((t.ended||t.accepted)-t.accepted)/MIN), t.fare, t.tip||0, t.surge ? "是" : "", t.pickLoc ? t.pickLoc.lat : "", t.pickLoc ? t.pickLoc.lng : "", t.dropLoc ? t.dropLoc.lat : "", t.dropLoc ? t.dropLoc.lng : ""]));
+  const rows = [["日期","星期","接單時間","區域","下車區域","等單分鐘","接客分鐘","載客分鐘","載客公里","實拿","小費","加成","對帳補記","上車緯度","上車經度","下車緯度","下車經度"]];
+  trips().forEach(t => rows.push([dayKey(t.accepted), DOW[dowOf(t.accepted)], hm(t.accepted), t.area||"", t.drop||"", Math.round((t.accepted-t.waitStart)/MIN), t.boarded ? Math.round((t.boarded-t.accepted)/MIN) : "", Math.round(((t.ended||t.accepted)-(t.boarded||t.accepted))/MIN), Number(t.km) > 0 ? t.km : "", t.fare, t.tip||0, t.surge ? "是" : "", t.adj ? "是" : "", t.pickLoc ? t.pickLoc.lat : "", t.pickLoc ? t.pickLoc.lng : "", t.dropLoc ? t.dropLoc.lat : "", t.dropLoc ? t.dropLoc.lng : ""]));
   return rows.map(r => r.join(",")).join("\n");
 }
 

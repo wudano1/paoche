@@ -1,5 +1,5 @@
 /* 離線快取：網頁本體每次先抓最新版（改版會自動更新），抓不到才用快取；其他檔案先用快取，背景更新。 */
-const CACHE = "paoche-v1";
+const CACHE = "paoche-v2";
 const SHELL = ["./", "index.html", "geo.js", "areas.json", "manifest.webmanifest", "icon-192.png", "icon-512.png", "apple-touch-icon.png"];
 self.addEventListener("install", e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)).then(() => self.skipWaiting()));
